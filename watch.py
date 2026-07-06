@@ -191,19 +191,23 @@ def send_telegram(text):
             )
             if r.json().get("ok"):
                 return True
+            print("telegram rejected:", r.text[:300])
         except Exception as e:
             print("telegram error:", e)
     return False
 
 
 def send_chunked(header, lines, footer=FOOTER):
+    ok = True
     msg = header
     for ln in lines:
         if len(msg) + len(ln) + len(footer) + 4 > 3800:
-            send_telegram(msg + "\n\n" + footer)
+            ok = send_telegram(msg + "\n\n" + footer) and ok
             msg = header + "（续）"
         msg += "\n" + ln
-    send_telegram(msg + "\n\n" + footer)
+    ok = send_telegram(msg + "\n\n" + footer) and ok
+    if not ok:
+        raise SystemExit("telegram send failed")
 
 
 def _grab(df, tickers, out):
