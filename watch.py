@@ -286,7 +286,8 @@ def run_watch():
         return
     prev = fetch_prev_close(list(HOLDINGS) + ["^IXIC"])
     state = load_state()
-    market_lines, stop_lines, crash_lines, entry_lines = [], [], [], []
+    market_lines, stop_lines, crash_lines = [], [], []
+    entry_by_sector = {}
 
     # 4) 大盘警报（每天最多一次）
     ixic, ixic_prev, vix = prices.get("^IXIC"), prev.get("^IXIC"), prices.get("^VIX")
@@ -314,12 +315,12 @@ def run_watch():
                 state.pop(key)
         if broken_new:
             tier_txt = "、".join(str(x) for x in broken_new)
-            line = f"【{tag}】{tk} {name}（{sector}）现价 {p:.2f}，触及建仓档位 {tier_txt}"
+            line = f"·【{tag}】{tk} {name}：{p:.2f}，触及档位 {tier_txt}"
             if tk in HOLDINGS:
-                line += "（你已持有）"
+                line += "（已持有）"
             if tk in LEVERAGED:
-                line += f"｜{LEVERAGED[tk]}杠杆产品，波动极大，仓位要小"
-            entry_lines.append(line)
+                line += f"（{LEVERAGED[tk]}杠杆，仓位要小）"
+            entry_by_sector.setdefault(sector, []).append(line)
         # 2) 止损提醒（持仓，成本价-15%，每次跌破提醒一次）
         if tk in HOLDINGS:
             shares, cost = HOLDINGS[tk]
@@ -345,9 +346,21 @@ def run_watch():
                     state[mv_key] = 1
 
     save_state(state)
-    lines = market_lines + stop_lines + crash_lines + entry_lines
+    lines = []
+    if market_lines:
+        lines += market_lines + [""]
+    if stop_lines or crash_lines:
+        lines += ["━━ 你的持仓 ━━"] + stop_lines + crash_lines + [""]
+    sector_order = ["存储", "科技龙头", "光模块", "CPU/半导体", "数据中心", "商业航天",
+                    "AI应用", "无人机/国防", "能源/核能", "医疗", "量子计算",
+                    "金融/加密", "稀土/资源", "消费", "ETF参考"]
+    for sec in sector_order:
+        if sec in entry_by_sector:
+            lines += [f"━━ {sec} ━━"] + entry_by_sector[sec] + [""]
+    while lines and lines[-1] == "":
+        lines.pop()
     if lines:
-        header = f"🔔 提醒（美东 {t:%m-%d %H:%M}）"
+        header = f"🔔 到价提醒（美东 {t:%m-%d %H:%M}）\n"
         send_chunked(header, lines)
         print(f"sent {len(lines)} lines")
     else:
