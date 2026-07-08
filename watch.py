@@ -11,7 +11,9 @@
 """
 import json
 import os
+import subprocess
 import sys
+import time
 import datetime
 from zoneinfo import ZoneInfo
 
@@ -157,18 +159,8 @@ WATCH = [
 
 NAME = {w[0]: w[1] for w in WATCH}
 STORAGE = ["MU", "SNDK", "STX", "WDC", "RMBS", "MRAM", "DRAM", "KORU"]
-# 持仓：代码 -> (股数, 成本价)
-HOLDINGS = {
-    "AAOI": (3, 134.84),
-    "AXTI": (18, 69.18),
-    "CRML": (6, 10.06),
-    "CRWV": (13, 100.31),
-    "MP": (7, 54.09),
-    "NVDA": (2, 197.30),
-    "OKLO": (2, 51.17),
-    "RMBS": (3, 118.31),
-    "SMR": (38, 9.86),
-}
+# 持仓：代码 -> [股数, 成本价]，存放在仓库密钥 HOLDINGS_JSON 里（不进代码，保护隐私）
+HOLDINGS = json.loads(os.environ.get("HOLDINGS_JSON", "{}"))
 LEVERAGED = {"KORU": "3倍", "SOXL": "3倍", "RAM": "2倍"}
 STOP_LOSS = 0.85      # 成本价的85%（亏15%）触发止损提醒
 CRASH = 0.08          # 持仓当日涨跌8%触发异动提醒
@@ -280,11 +272,39 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=1, sort_keys=True)
 
 
+def git_push_state():
+    """循环模式下每轮巡查后把 state.json 推回仓库，防止中途被取消丢记录"""
+    try:
+        g = ["git", "-c", "user.name=watch-bot", "-c", "user.email=actions@users.noreply.github.com"]
+        subprocess.run(g + ["add", STATE_FILE], check=False)
+        r = subprocess.run(g + ["diff", "--cached", "--quiet"])
+        if r.returncode != 0:
+            subprocess.run(g + ["commit", "-m", "update state [skip ci]"], check=False)
+            subprocess.run(g + ["pull", "--rebase", "-X", "theirs"], check=False)
+            subprocess.run(g + ["push"], check=False)
+    except Exception as e:
+        print("git push state error:", e)
+
+
 def run_watch():
-    t = now_et()
-    if not market_open(t):
-        print("market closed, skip:", t)
-        return
+    """循环模式：只要美股开着，每10分钟巡查一轮，直到收盘"""
+    started = time.time()
+    cycles = 0
+    while True:
+        t = now_et()
+        if not market_open(t):
+            print("market closed:", t, "cycles done:", cycles)
+            break
+        watch_cycle(t)
+        git_push_state()
+        cycles += 1
+        if time.time() - started > 380 * 60:
+            print("6-hour runner limit reached, exit")
+            break
+        time.sleep(600)
+
+
+def watch_cycle(t):
     today = str(t.date())
     tickers = [w[0] for w in WATCH]
     prices = fetch_prices(tickers + ["^IXIC", "^VIX"])
@@ -403,6 +423,10 @@ def upcoming_earnings():
 def run_digest():
     bj = datetime.datetime.now(ZoneInfo("Asia/Shanghai"))
     et = now_et()
+    dg_key = f"DG:{bj:%Y-%m-%d}"
+    if dg_key in load_state():
+        print("digest already sent today, skip")
+        return
     prices = fetch_prices(STORAGE)
     hit, near, far = [], [], []
     for tk in STORAGE:
@@ -431,6 +455,9 @@ def run_digest():
         lines.append("KORU 是3倍杠杆产品，波动极大，仓位要小。")
     lines += upcoming_earnings()
     send_chunked(header, lines)
+    s = load_state()
+    s[dg_key] = 1
+    save_state(s)
     print("digest sent")
 
 
