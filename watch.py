@@ -461,8 +461,46 @@ def run_digest():
     print("digest sent")
 
 
+def run_snapshot():
+    """当前到价全景快照：不做去重，把所有处于建仓区的股票发一遍"""
+    t = now_et()
+    prices = fetch_prices([w[0] for w in WATCH])
+    by_sector = {}
+    total = 0
+    for tk, name, sector, tiers, tag in WATCH:
+        p = prices.get(tk)
+        if p is None:
+            continue
+        hit = [x for x in tiers if p <= x]
+        if not hit:
+            continue
+        total += 1
+        line = f"·【{tag}】{tk} {name}：{p:.2f}，在档位 {'、'.join(str(x) for x in hit)} 之下"
+        if tk in HOLDINGS:
+            line += "（已持有）"
+        if tk in LEVERAGED:
+            line += f"（{LEVERAGED[tk]}杠杆，仓位要小）"
+        by_sector.setdefault(sector, []).append(line)
+    lines = []
+    sector_order = ["存储", "科技龙头", "光模块", "CPU/半导体", "数据中心", "商业航天",
+                    "AI应用", "无人机/国防", "能源/核能", "医疗", "量子计算",
+                    "金融/加密", "稀土/资源", "消费", "ETF参考"]
+    for sec in sector_order:
+        if sec in by_sector:
+            lines += [f"━━ {sec} ━━"] + by_sector[sec] + [""]
+    while lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        lines = ["当前没有任何股票在建仓区"]
+    header = f"📸 当前到价全景（共{total}只，美东 {t:%m-%d %H:%M}）\n"
+    send_chunked(header, lines)
+    print(f"snapshot sent: {total} stocks")
+
+
 if __name__ == "__main__":
     if "--digest" in sys.argv:
         run_digest()
+    elif "--snapshot" in sys.argv:
+        run_snapshot()
     else:
         run_watch()
