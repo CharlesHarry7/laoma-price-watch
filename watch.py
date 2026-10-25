@@ -180,8 +180,10 @@ def market_open(t):
 
 
 def send_telegram(text):
-    token = os.environ["TG_TOKEN"]
-    chat = os.environ["TG_CHAT"]
+    token = os.environ.get("TG_TOKEN")
+    chat = os.environ.get("TG_CHAT")
+    if not token or not chat:
+        raise SystemExit("缺少 TG_TOKEN / TG_CHAT：本地请 export，Actions 请配 Secrets")
     for _ in range(2):
         try:
             r = requests.post(
@@ -211,9 +213,13 @@ def send_chunked(header, lines, footer=FOOTER):
 
 
 def _grab(df, tickers, out):
+    """按代码取收盘价。yfinance 只请求一个代码时返回扁平列名，两种形状都要认。"""
     for t in tickers:
         try:
-            s = df[t]["Close"].dropna()
+            try:
+                s = df[t]["Close"].dropna()
+            except (KeyError, TypeError):
+                s = df["Close"].dropna()
             if len(s):
                 out[t] = float(s.iloc[-1])
         except Exception:
@@ -261,29 +267,72 @@ def fetch_prev_close(tickers):
 
 
 def load_state():
-    if os.path.exists(STATE_FILE):
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError) as e:
+        # 上一轮被取消时可能只写了一半；留档后从空状态继续，别让整轮盯盘崩掉
+        print("state read error:", e)
+        try:
+            os.replace(STATE_FILE, STATE_FILE + ".corrupt")
+        except OSError:
+            pass
+        return {}
+
+
+# 按日期记账的键，日期永远在最后一段：DG:2026-10-25 / MKT:2026-10-25 / MV:NVDA:2026-10-25 / ER:NVDA:2026-10-30
+DATED_PREFIXES = ("DG:", "MKT:", "MV:", "ER:")
+
+
+def prune_state(state, keep_days=7):
+    """删掉过期的日期键。档位键（代码@价格）和止损键（SL:）保留，它们靠价格回升自动重置。"""
+    cutoff = datetime.datetime.now(ZoneInfo("America/New_York")).date() - datetime.timedelta(days=keep_days)
+    for key in list(state):
+        if not key.startswith(DATED_PREFIXES):
+            continue
+        try:
+            day = datetime.date.fromisoformat(key.rsplit(":", 1)[-1])
+        except ValueError:
+            continue
+        if day < cutoff:
+            state.pop(key, None)
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    prune_state(state)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=1, sort_keys=True)
+    os.replace(tmp, STATE_FILE)  # 原子替换：中断时要么旧文件要么新文件，不会留半个 JSON
 
 
-def git_push_state():
-    """循环模式下每轮巡查后把 state.json 推回仓库，防止中途被取消丢记录"""
+def git_push_state(retries=3):
+    """循环模式下每轮巡查后把 state.json 推回仓库，防止中途被取消丢记录。
+
+    盘中/日报/快照三个 workflow 可能同时改这个文件，push 会撞上 non-fast-forward；
+    这里重试 pull --rebase，失败则中止残留的 rebase，避免仓库卡在半途中继状态。
+    """
     try:
         g = ["git", "-c", "user.name=watch-bot", "-c", "user.email=actions@users.noreply.github.com"]
         subprocess.run(g + ["add", STATE_FILE], check=False)
-        r = subprocess.run(g + ["diff", "--cached", "--quiet"])
-        if r.returncode != 0:
-            subprocess.run(g + ["commit", "-m", "update state [skip ci]"], check=False)
-            subprocess.run(g + ["pull", "--rebase", "-X", "theirs"], check=False)
-            subprocess.run(g + ["push"], check=False)
+        if subprocess.run(g + ["diff", "--cached", "--quiet"], check=False).returncode == 0:
+            return True
+        subprocess.run(g + ["commit", "-q", "-m", "update state [skip ci]"], check=False)
+        for attempt in range(1, retries + 1):
+            subprocess.run(g + ["pull", "--rebase", "--autostash", "-X", "theirs", "--quiet"], check=False)
+            if subprocess.run(g + ["push", "--quiet"], check=False).returncode == 0:
+                return True
+            print(f"git push state failed, retry {attempt}/{retries}")
+            subprocess.run(g + ["rebase", "--abort"], check=False)
+            time.sleep(2 * attempt)
+        print("git push state gave up; state only persists for this run")
+        return False
     except Exception as e:
         print("git push state error:", e)
+        return False
 
 
 def run_watch():
